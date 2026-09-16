@@ -1756,6 +1756,70 @@ async function clearAdminActiveTheme(request, env, user) {
 
 const MAX_MEDIA_CHUNK_SIZE = 80 * 1024; 
 
+const MEDIA_R2_PREFIX = 'media/';
+const MEDIA_R2_CHUNK_PREFIX = 'media-chunk/';
+
+function getMediaR2(env) {
+  return env.DB_R2 || null;
+}
+
+function r2ObjectKey(id) {
+  return `${MEDIA_R2_PREFIX}${id}`;
+}
+
+function r2ChunkKey(id, index) {
+  return `${MEDIA_R2_CHUNK_PREFIX}${id}/${index}`;
+}
+
+async function r2PutBase64(env, key, base64, mimeType) {
+  const r2 = getMediaR2(env);
+  if (!r2 || !base64) return false;
+  try {
+    await r2.put(key, base64ToBytes(base64), {
+      httpMetadata: { contentType: mimeType || 'image/jpeg' },
+    });
+    return true;
+  } catch (err) {
+    console.error('R2 写入失败:', key, err && err.message);
+    return false;
+  }
+}
+
+async function r2GetBytes(env, key) {
+  const r2 = getMediaR2(env);
+  if (!r2) return null;
+  try {
+    const obj = await r2.get(key);
+    if (!obj) return null;
+    return await obj.arrayBuffer();
+  } catch (err) {
+    console.error('R2 读取失败:', key, err && err.message);
+    return null;
+  }
+}
+
+async function r2DeleteKeys(env, keys) {
+  const r2 = getMediaR2(env);
+  if (!r2 || !keys.length) return;
+  try {
+    await r2.delete(keys);
+  } catch (err) {
+    console.error('R2 删除失败:', err && err.message);
+  }
+}
+
+async function r2ListKeys(env, prefix) {
+  const r2 = getMediaR2(env);
+  if (!r2) return [];
+  try {
+    const listed = await r2.list({ prefix, limit: 1000 });
+    return (listed.objects || []).map((o) => o.key);
+  } catch (err) {
+    console.error('R2 列举失败:', prefix, err && err.message);
+    return [];
+  }
+}
+
 async function uploadMedia(request, env, user) {
   const body = await request.json();
   const name = String(body.name || 'image.jpg');
@@ -1774,10 +1838,17 @@ async function uploadMedia(request, env, user) {
   const result = await env.DB_MEDIA.prepare(
     'INSERT INTO media (name, mime_type, size, base64_data, width, height, chunk_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
   )
-    .bind(name, mimeType, size, base64, width, height, 0, now())
+    .bind(name, mimeType, size, '', width, height, 0, now())
     .run();
 
   const id = result.meta ? result.meta.last_row_id : null;
+
+  const stored = await r2PutBase64(env, r2ObjectKey(id), base64, mimeType);
+  if (!stored) {
+    await env.DB_MEDIA.prepare('DELETE FROM media WHERE id = ?').bind(id).run();
+    return jsonResponse(500, null, '图片写入 R2 失败，请检查 R2 绑定 DB_R2');
+  }
+
   return jsonResponse(0, { id, url: `/api/v1/media/${id}`, size }, '上传成功');
 }
 
@@ -1816,11 +1887,8 @@ async function uploadMediaChunk(request, env, user) {
   if (!chunkData) return jsonResponse(400, null, '分片数据为空');
   if (chunkData.length > MAX_MEDIA_CHUNK_SIZE) return jsonResponse(413, null, '分片过大');
 
-  await env.DB_MEDIA.prepare(
-    'INSERT INTO media_chunks (media_id, chunk_index, chunk_data, created_at) VALUES (?, ?, ?, ?)'
-  )
-    .bind(mediaId, chunkIndex, chunkData, now())
-    .run();
+  const stored = await r2PutBase64(env, r2ChunkKey(mediaId, chunkIndex), chunkData, null);
+  if (!stored) return jsonResponse(500, null, '分片写入 R2 失败');
 
   return jsonResponse(0, null, '分片上传成功');
 }
@@ -1830,35 +1898,65 @@ async function finalizeMediaUpload(request, env, user) {
   const mediaId = parseInt(pathParts[pathParts.length - 1], 10);
   if (!mediaId) return jsonResponse(400, null, '媒体 ID 无效');
 
-  const media = await env.DB_MEDIA.prepare('SELECT chunk_count FROM media WHERE id = ?')
+  const media = await env.DB_MEDIA.prepare('SELECT chunk_count, mime_type FROM media WHERE id = ?')
     .bind(mediaId)
     .first();
   if (!media) return jsonResponse(404, null, '媒体不存在');
 
-  const chunkRows = await env.DB_MEDIA.prepare(
-    'SELECT chunk_index FROM media_chunks WHERE media_id = ? ORDER BY chunk_index ASC'
-  )
-    .bind(mediaId)
-    .all();
+  const chunkCount = Number(media.chunk_count) || 0;
 
-  const uploaded = new Set((chunkRows.results || []).map((r) => r.chunk_index));
+  
+  const existingKeys = await r2ListKeys(env, `${MEDIA_R2_CHUNK_PREFIX}${mediaId}/`);
+  const uploaded = new Set(
+    existingKeys
+      .map((k) => parseInt(k.slice(k.lastIndexOf('/') + 1), 10))
+      .filter((n) => !isNaN(n))
+  );
+
   const missing = [];
-  for (let i = 0; i < media.chunk_count; i++) {
+  for (let i = 0; i < chunkCount; i++) {
     if (!uploaded.has(i)) missing.push(i);
   }
   if (missing.length > 0) {
     return jsonResponse(400, { missing }, `缺少分片: ${missing.join(', ')}`);
   }
 
+  
+  const parts = [];
+  for (let i = 0; i < chunkCount; i++) {
+    const buf = await r2GetBytes(env, r2ChunkKey(mediaId, i));
+    if (!buf) return jsonResponse(500, null, `读取分片 ${i} 失败`);
+    parts.push(buf);
+  }
+  const total = parts.reduce((sum, p) => sum + p.byteLength, 0);
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const p of parts) {
+    merged.set(new Uint8Array(p), offset);
+    offset += p.byteLength;
+  }
+
+  const r2 = getMediaR2(env);
+  try {
+    await r2.put(r2ObjectKey(mediaId), merged, {
+      httpMetadata: { contentType: String(media.mime_type || 'image/jpeg') },
+    });
+  } catch (err) {
+    console.error('R2 合并写入失败:', err && err.message);
+    return jsonResponse(500, null, '合并分片写入 R2 失败');
+  }
+
+  
+  await r2DeleteKeys(env, existingKeys);
+
   return jsonResponse(0, { id: mediaId, url: `/api/v1/media/${mediaId}` }, '上传完成');
 }
 
 async function getMedia(env, id, request, ctx) {
   const cacheKey = new URL(request.url);
-  let response;
   try {
-    response = await caches.default.match(cacheKey);
-    if (response) return response;
+    const cached = await caches.default.match(cacheKey);
+    if (cached) return cached;
   } catch {
     
   }
@@ -1871,40 +1969,65 @@ async function getMedia(env, id, request, ctx) {
   if (!row) return new Response('Not found', { status: 404 });
 
   const mimeType = String(row.mime_type || 'image/jpeg');
-  let base64 = String(row.base64_data || '');
 
-  if (row.chunk_count > 0) {
-    const chunkRows = await env.DB_MEDIA.prepare(
-      'SELECT chunk_data FROM media_chunks WHERE media_id = ? ORDER BY chunk_index ASC'
-    )
-      .bind(id)
-      .all();
-    const chunks = (chunkRows.results || []).map((r) => String(r.chunk_data || ''));
-    if (chunks.length !== row.chunk_count) {
-      return new Response('Media incomplete', { status: 500 });
+  
+  let binaryBuffer = await r2GetBytes(env, r2ObjectKey(id));
+
+  
+  
+  if (!binaryBuffer && Number(row.chunk_count) > 0) {
+    const chunkKeys = await r2ListKeys(env, `${MEDIA_R2_CHUNK_PREFIX}${id}/`);
+    if (chunkKeys.length) {
+      const sorted = chunkKeys
+        .map((k) => ({ k, i: parseInt(k.slice(k.lastIndexOf('/') + 1), 10) }))
+        .filter((x) => !isNaN(x.i))
+        .sort((a, b) => a.i - b.i);
+      const parts = [];
+      for (const item of sorted) {
+        const buf = await r2GetBytes(env, item.k);
+        if (buf) parts.push(buf);
+      }
+      if (parts.length) {
+        const total = parts.reduce((sum, p) => sum + p.byteLength, 0);
+        const merged = new Uint8Array(total);
+        let offset = 0;
+        for (const p of parts) {
+          merged.set(new Uint8Array(p), offset);
+          offset += p.byteLength;
+        }
+        binaryBuffer = merged.buffer;
+      }
     }
-    base64 = chunks.join('');
   }
 
-  if (!base64) {
-    return new Response('Media data empty', { status: 500 });
+  
+  if (!binaryBuffer) {
+    let base64 = String(row.base64_data || '');
+    if (!base64 && Number(row.chunk_count) > 0) {
+      const chunkRows = await env.DB_MEDIA.prepare(
+        'SELECT chunk_data FROM media_chunks WHERE media_id = ? ORDER BY chunk_index ASC'
+      )
+        .bind(id)
+        .all();
+      const chunks = (chunkRows.results || []).map((r) => String(r.chunk_data || ''));
+      if (chunks.length !== Number(row.chunk_count)) {
+        return new Response('Media incomplete', { status: 500 });
+      }
+      base64 = chunks.join('');
+    }
+    if (!base64) return new Response('Media data empty', { status: 500 });
+    try {
+      binaryBuffer = base64ToBytes(base64);
+    } catch (e) {
+      return new Response('Media decode failed', { status: 500 });
+    }
   }
 
-  let binary;
-  try {
-    binary = Uint8Array.from(
-      atob(base64)
-        .split('')
-        .map((c) => c.charCodeAt(0))
-    );
-  } catch (e) {
-    return new Response('Media decode failed', { status: 500 });
-  }
-  response = new Response(binary, {
+  const response = new Response(binaryBuffer, {
     headers: {
       'Content-Type': mimeType,
       'Cache-Control': 'public, max-age=86400',
-      'Content-Length': String(binary.length),
+      'Content-Length': String(binaryBuffer.byteLength),
     },
   });
 
@@ -1924,10 +2047,15 @@ async function deleteMedia(request, env, user) {
   const row = await env.DB_MEDIA.prepare('SELECT id FROM media WHERE id = ?').bind(mediaId).first();
   if (!row) return jsonResponse(404, null, '媒体不存在');
 
+  
+  await r2DeleteKeys(env, [r2ObjectKey(mediaId)]);
+  const chunkKeys = await r2ListKeys(env, `${MEDIA_R2_CHUNK_PREFIX}${mediaId}/`);
+  await r2DeleteKeys(env, chunkKeys);
+
+  
   await env.DB_MEDIA.prepare('DELETE FROM media_chunks WHERE media_id = ?').bind(mediaId).run();
   await env.DB_MEDIA.prepare('DELETE FROM media WHERE id = ?').bind(mediaId).run();
 
-  
   try {
     const publicUrl = new URL(`/api/v1/media/${mediaId}`, request.url);
     await caches.default.delete(publicUrl);
@@ -2021,12 +2149,28 @@ async function listAdminMedia(request, env, user) {
 
 async function getAdminMediaUsage(request, env, user) {
   try {
+    const r2 = getMediaR2(env);
+    if (r2) {
+      let totalSize = 0;
+      let count = 0;
+      let cursor;
+      do {
+        const listed = await r2.list({ prefix: MEDIA_R2_PREFIX, limit: 1000, cursor });
+        for (const obj of listed.objects || []) {
+          if (!/^media\/\d+$/.test(obj.key)) continue;
+          totalSize += obj.size || 0;
+          count++;
+        }
+        cursor = listed.truncated ? listed.cursor : undefined;
+      } while (cursor);
+      return jsonResponse(0, { totalSize, count, storage: 'r2' });
+    }
+
     const row = await env.DB_MEDIA.prepare(
       'SELECT COALESCE(SUM(size), 0) as total, COUNT(*) as count FROM media'
     ).first();
-    
     const totalSize = Math.floor(Number(row.total) * 1.42);
-    return jsonResponse(0, { totalSize, count: row.count });
+    return jsonResponse(0, { totalSize, count: row.count, storage: 'd1' });
   } catch (err) {
     return jsonResponse(500, null, `统计媒体用量失败: ${err.message}`);
   }
@@ -2037,14 +2181,39 @@ async function getAdminMediaUsageDetail(request, env, user) {
     const rawRow = await env.DB_MEDIA.prepare(
       'SELECT COALESCE(SUM(size), 0) as total FROM media'
     ).first();
+    const countRow = await env.DB_MEDIA.prepare('SELECT COUNT(*) as count FROM media').first();
+    const rawSize = Number(rawRow.total);
+
+    const r2 = getMediaR2(env);
+    if (r2) {
+      let r2Size = 0;
+      let cursor;
+      do {
+        const listed = await r2.list({ prefix: MEDIA_R2_PREFIX, limit: 1000, cursor });
+        for (const obj of listed.objects || []) {
+          if (!/^media\/\d+$/.test(obj.key)) continue;
+          r2Size += obj.size || 0;
+        }
+        cursor = listed.truncated ? listed.cursor : undefined;
+      } while (cursor);
+      return jsonResponse(0, {
+        rawSize,
+        base64Size: 0,
+        chunkSize: 0,
+        r2Size,
+        totalSize: r2Size,
+        count: countRow.count,
+        ratio: rawSize > 0 ? Number((r2Size / rawSize).toFixed(2)) : 0,
+        storage: 'r2',
+      });
+    }
+
     const mediaRow = await env.DB_MEDIA.prepare(
       'SELECT COALESCE(SUM(LENGTH(base64_data)), 0) as total FROM media'
     ).first();
     const chunksRow = await env.DB_MEDIA.prepare(
       'SELECT COALESCE(SUM(LENGTH(chunk_data)), 0) as total FROM media_chunks'
     ).first();
-    const countRow = await env.DB_MEDIA.prepare('SELECT COUNT(*) as count FROM media').first();
-    const rawSize = Number(rawRow.total);
     const base64Size = Number(mediaRow.total);
     const chunkSize = Number(chunksRow.total);
     const totalSize = base64Size + chunkSize;
@@ -2055,6 +2224,7 @@ async function getAdminMediaUsageDetail(request, env, user) {
       totalSize,
       count: countRow.count,
       ratio: rawSize > 0 ? Number((totalSize / rawSize).toFixed(2)) : 0,
+      storage: 'd1',
     });
   } catch (err) {
     return jsonResponse(500, null, `精确统计媒体用量失败: ${err.message}`);
@@ -2104,37 +2274,22 @@ async function updateAdminMedia(request, env, user) {
   const size = Math.floor(base64.length * 0.75);
 
   
-  await env.DB_MEDIA.prepare('DELETE FROM media_chunks WHERE media_id = ?').bind(id).run();
-
-  if (base64.length <= MAX_MEDIA_CHUNK_SIZE) {
-    
-    await env.DB_MEDIA.prepare(
-      `UPDATE media SET name = ?, mime_type = ?, size = ?, base64_data = ?, width = ?, height = ?, chunk_count = 0, created_at = ?
-       WHERE id = ?`
-    )
-      .bind(name, mimeType, size, base64, width, height, now(), id)
-      .run();
-  } else {
-    
-    const chunkCount = Math.ceil(base64.length / MAX_MEDIA_CHUNK_SIZE);
-    await env.DB_MEDIA.prepare(
-      `UPDATE media SET name = ?, mime_type = ?, size = ?, base64_data = ?, width = ?, height = ?, chunk_count = ?, created_at = ?
-       WHERE id = ?`
-    )
-      .bind(name, mimeType, size, '', width, height, chunkCount, now(), id)
-      .run();
-
-    for (let i = 0; i < chunkCount; i++) {
-      const chunkData = base64.slice(i * MAX_MEDIA_CHUNK_SIZE, (i + 1) * MAX_MEDIA_CHUNK_SIZE);
-      await env.DB_MEDIA.prepare(
-        'INSERT INTO media_chunks (media_id, chunk_index, chunk_data, created_at) VALUES (?, ?, ?, ?)'
-      )
-        .bind(id, i, chunkData, now())
-        .run();
-    }
-  }
+  const stored = await r2PutBase64(env, r2ObjectKey(id), base64, mimeType);
+  if (!stored) return jsonResponse(500, null, '图片写入 R2 失败，请检查 R2 绑定 DB_R2');
 
   
+  const oldChunkKeys = await r2ListKeys(env, `${MEDIA_R2_CHUNK_PREFIX}${id}/`);
+  await r2DeleteKeys(env, oldChunkKeys);
+
+  await env.DB_MEDIA.prepare('DELETE FROM media_chunks WHERE media_id = ?').bind(id).run();
+
+  await env.DB_MEDIA.prepare(
+    `UPDATE media SET name = ?, mime_type = ?, size = ?, base64_data = ?, width = ?, height = ?, chunk_count = 0, created_at = ?
+     WHERE id = ?`
+  )
+    .bind(name, mimeType, size, '', width, height, now(), id)
+    .run();
+
   try {
     const publicUrl = new URL(`/api/v1/media/${id}`, request.url);
     await caches.default.delete(publicUrl);
@@ -2151,6 +2306,7 @@ async function listDatabases(request, env, user) {
   if (env.DB_POSTS) bindings.push({ binding: 'DB_POSTS', name: 'myblog-posts' });
   if (env.DB_CONFIG) bindings.push({ binding: 'DB_CONFIG', name: 'myblog-config' });
   if (env.DB_MEDIA) bindings.push({ binding: 'DB_MEDIA', name: 'myblog-media' });
+  if (env.DB_R2) bindings.push({ binding: 'DB_R2', name: 'r2data', type: 'r2' });
 
   
   const stats = {};
