@@ -1759,8 +1759,69 @@ const MAX_MEDIA_CHUNK_SIZE = 80 * 1024;
 const MEDIA_R2_PREFIX = 'media/';
 const MEDIA_R2_CHUNK_PREFIX = 'media-chunk/';
 
+// 允许上传的文件类型：图片 + 常用附件
+// 说明：不限死具体 mime，按「大类前缀 + 白名单后缀」双重放行，避免误挡小众格式
+const IMAGE_MIME_PREFIX = 'image/';
+const ALLOWED_FILE_MIME_PREFIXES = ['image/', 'video/', 'audio/', 'text/'];
+const ALLOWED_FILE_EXTS = [
+  // 压缩包
+  'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'tgz',
+  // 文档
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'csv', 'txt', 'md', 'rtf',
+  'odt', 'ods', 'odp', 'wps', 'et', 'dps',
+  // 图纸 / 工程
+  'dwg', 'dxf', 'dwt', 'dwf', 'step', 'stp', 'iges', 'igs', 'stl', 'sldprt', 'sldasm',
+  // 其他常见
+  'json', 'xml', 'yml', 'yaml', 'ini', 'cfg', 'dat', 'bin', 'iso',
+];
+
+// 单个文件上限（分片机制可支持），这里只对单接口做限制
+const MAX_MEDIA_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
+
 function getMediaR2(env) {
   return env.DB_R2 || null;
+}
+
+function fileExt(name) {
+  const m = String(name || '').toLowerCase().match(/\.([a-z0-9]+)$/);
+  return m ? m[1] : '';
+}
+
+/**
+ * 校验上传文件类型是否被允许
+ * 图片一律放行；其他类型需 mime 大类在白名单或扩展名在白名单
+ */
+function isAllowedFileType(name, mimeType) {
+  const mime = String(mimeType || '').toLowerCase();
+  if (mime.startsWith(IMAGE_MIME_PREFIX)) return true;
+  if (mime.startsWith('application/octet-stream')) {
+    // 浏览器对 rar/7z/dwg 等常报通用二进制，退回扩展名判断
+    return ALLOWED_FILE_EXTS.includes(fileExt(name));
+  }
+  if (ALLOWED_FILE_MIME_PREFIXES.some((p) => mime.startsWith(p))) return true;
+  return ALLOWED_FILE_EXTS.includes(fileExt(name));
+}
+
+const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'avif', 'ico'];
+
+function isImageFile(name, mimeType) {
+  const mime = String(mimeType || '').toLowerCase();
+  if (mime.startsWith(IMAGE_MIME_PREFIX)) return true;
+  return IMAGE_EXTS.includes(fileExt(name));
+}
+
+/**
+ * 生成下载响应头：非图片强制触发下载并带上原始文件名
+ */
+function isDownloadableType(name, mimeType) {
+  return !isImageFile(name, mimeType);
+}
+
+function contentDisposition(name) {
+  const safe = String(name || 'download').replace(/["\\\r\n]/g, '_');
+  // ASCII 回退名 + RFC 5987 UTF-8 名，兼容中文
+  const asciiFallback = safe.replace(/[^\x20-\x7E]/g, '_');
+  return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(safe)}`;
 }
 
 function r2ObjectKey(id) {
@@ -1828,13 +1889,18 @@ async function uploadMedia(request, env, user) {
   const width = body.width ? parseInt(body.width, 10) : null;
   const height = body.height ? parseInt(body.height, 10) : null;
 
-  if (!base64) return jsonResponse(400, null, '图片数据为空');
-  if (!mimeType.startsWith('image/')) return jsonResponse(400, null, '仅支持图片');
+  if (!base64) return jsonResponse(400, null, '文件数据为空');
+  if (!isAllowedFileType(name, mimeType)) {
+    return jsonResponse(400, null, '不支持的文件类型');
+  }
+  const size = Math.floor(base64.length * 0.75);
+  if (size > MAX_MEDIA_FILE_SIZE) {
+    return jsonResponse(413, null, '文件超过 100 MB 上限');
+  }
   if (base64.length > MAX_MEDIA_CHUNK_SIZE) {
-    return jsonResponse(413, null, '图片超过单接口上限，请使用分片上传');
+    return jsonResponse(413, null, '文件超过单接口上限，请使用分片上传');
   }
 
-  const size = Math.floor(base64.length * 0.75);
   const result = await env.DB_MEDIA.prepare(
     'INSERT INTO media (name, mime_type, size, base64_data, width, height, chunk_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
   )
@@ -1846,7 +1912,7 @@ async function uploadMedia(request, env, user) {
   const stored = await r2PutBase64(env, r2ObjectKey(id), base64, mimeType);
   if (!stored) {
     await env.DB_MEDIA.prepare('DELETE FROM media WHERE id = ?').bind(id).run();
-    return jsonResponse(500, null, '图片写入 R2 失败，请检查 R2 绑定 DB_R2');
+    return jsonResponse(500, null, '文件写入 R2 失败，请检查 R2 绑定 DB_R2');
   }
 
   return jsonResponse(0, { id, url: `/api/v1/media/${id}`, size }, '上传成功');
@@ -1863,7 +1929,10 @@ async function initMediaUpload(request, env, user) {
 
   if (!chunkCount || chunkCount <= 0) return jsonResponse(400, null, '分片数量无效');
   if (!size) return jsonResponse(400, null, '文件大小无效');
-  if (!mimeType.startsWith('image/')) return jsonResponse(400, null, '仅支持图片');
+  if (size > MAX_MEDIA_FILE_SIZE) return jsonResponse(413, null, '文件超过 100 MB 上限');
+  if (!isAllowedFileType(name, mimeType)) {
+    return jsonResponse(400, null, '不支持的文件类型');
+  }
 
   const result = await env.DB_MEDIA.prepare(
     'INSERT INTO media (name, mime_type, size, base64_data, width, height, chunk_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
@@ -2023,13 +2092,21 @@ async function getMedia(env, id, request, ctx) {
     }
   }
 
-  const response = new Response(binaryBuffer, {
-    headers: {
-      'Content-Type': mimeType,
-      'Cache-Control': 'public, max-age=86400',
-      'Content-Length': String(binaryBuffer.byteLength),
-    },
-  });
+  const fileName = String(row.name || '');
+  const headers = {
+    'Content-Type': mimeType,
+    'Cache-Control': 'public, max-age=86400',
+    'Content-Length': String(binaryBuffer.byteLength),
+  };
+
+  // 非图片文件强制下载并带上原始文件名；图片保持内联显示
+  // ?download=1 可强制任何文件走下载（包含图片）
+  const forceDownload = new URL(request.url).searchParams.get('download') === '1';
+  if (forceDownload || isDownloadableType(fileName, mimeType)) {
+    headers['Content-Disposition'] = contentDisposition(fileName || `file-${id}`);
+  }
+
+  const response = new Response(binaryBuffer, { headers });
 
   try {
     ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
@@ -2264,14 +2341,17 @@ async function updateAdminMedia(request, env, user) {
   const height = body.height ? parseInt(body.height, 10) : null;
   const name = body.name ? String(body.name) : row.name;
 
-  if (!rawBase64) return jsonResponse(400, null, '图片数据为空');
-  if (!mimeType.startsWith('image/')) return jsonResponse(400, null, '仅支持图片');
+  if (!rawBase64) return jsonResponse(400, null, '文件数据为空');
+  if (!isAllowedFileType(name, mimeType)) {
+    return jsonResponse(400, null, '不支持的文件类型');
+  }
 
   
   const base64 = rawBase64.includes(',') ? rawBase64.split(',')[1] : rawBase64;
-  if (!base64) return jsonResponse(400, null, '图片数据为空');
+  if (!base64) return jsonResponse(400, null, '文件数据为空');
 
   const size = Math.floor(base64.length * 0.75);
+  if (size > MAX_MEDIA_FILE_SIZE) return jsonResponse(413, null, '文件超过 100 MB 上限');
 
   
   const stored = await r2PutBase64(env, r2ObjectKey(id), base64, mimeType);

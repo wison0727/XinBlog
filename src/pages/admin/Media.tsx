@@ -37,10 +37,17 @@ import {
   Delete,
   Compress,
   CloudQueue,
+  InsertDriveFile,
+  FolderZip,
+  PictureAsPdf,
+  Description,
+  TableChart,
+  Slideshow,
+  Image as ImageIcon,
 } from '@mui/icons-material';
 import { useSnackbar } from 'notistack';
 import { fetchAdminMedia, fetchAdminMediaDetail, updateAdminMedia, fetchAdminMediaUsage } from '@/api/admin';
-import { deleteMedia, getMediaUrl, extractMediaId } from '@/api/media';
+import { deleteMedia, getMediaUrl, extractMediaId, isImageMime } from '@/api/media';
 import { Loading } from '@/components/Common/Loading';
 import { ConfirmDialog } from '@/components/Common/ConfirmDialog';
 import { LazyImage } from '@/components/Common/LazyImage';
@@ -56,6 +63,27 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+/** 按扩展名/类型给非图片文件配一个图标 */
+function FileTypeIcon({ name, mime, size = 32 }: { name: string; mime: string; size?: number }) {
+  const ext = (name.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] || '').toLowerCase();
+
+  const pick = () => {
+    if (['zip', 'rar', '7z', 'tar', 'gz', 'tgz', 'bz2', 'xz'].includes(ext)) return <FolderZip sx={{ fontSize: size }} />;
+    if (ext === 'pdf' || mime === 'application/pdf') return <PictureAsPdf sx={{ fontSize: size }} />;
+    if (['xls', 'xlsx', 'csv', 'et', 'ods'].includes(ext)) return <TableChart sx={{ fontSize: size }} />;
+    if (['ppt', 'pptx', 'dps', 'odp'].includes(ext)) return <Slideshow sx={{ fontSize: size }} />;
+    if (['doc', 'docx', 'rtf', 'odt', 'wps', 'txt', 'md'].includes(ext)) return <Description sx={{ fontSize: size }} />;
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'avif', 'ico'].includes(ext)) return <ImageIcon sx={{ fontSize: size }} />;
+    return <InsertDriveFile sx={{ fontSize: size }} />;
+  };
+
+  return (
+    <Box sx={{ color: 'primary.main', opacity: 0.75, display: 'flex' }}>
+      {pick()}
+    </Box>
+  );
 }
 
 import { getBase64Size, compressImageSource } from '@/utils/image';
@@ -355,27 +383,37 @@ export function AdminMedia() {
         : `0 4px 20px ${alpha(t.palette.common.black, 0.25)}`,
   };
 
-  const renderPreview = (item: AdminMedia, size: number) => (
-    <Box
-      sx={{
-        width: size,
-        height: size,
-        borderRadius: 1,
-        overflow: 'hidden',
-        bgcolor: (theme) => alpha(theme.palette.primary.main, 0.06),
-        flexShrink: 0,
-      }}
-    >
-      <LazyImage
-        src={getMediaUrl(item.id)}
-        alt={item.name}
-        objectFit="cover"
-        placeholder="skeleton"
-        style={{ borderRadius: 0 }}
-      />
-    </Box>
+  const renderPreview = (item: AdminMedia, size: number) => {
+    const image = isImageMime(item.mime_type || '');
+    return (
+      <Box
+        sx={{
+          width: size,
+          height: size,
+          borderRadius: 1,
+          overflow: 'hidden',
+          bgcolor: (theme) => alpha(theme.palette.primary.main, 0.06),
+          flexShrink: 0,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        {image ? (
+          <LazyImage
+            src={getMediaUrl(item.id)}
+            alt={item.name}
+            objectFit="cover"
+            placeholder="skeleton"
+            style={{ borderRadius: 0 }}
+          />
+        ) : (
+          <FileTypeIcon name={item.name} mime={item.mime_type || ''} size={Math.min(size * 0.5, 40)} />
+        )}
+      </Box>
 
-  );
+    );
+  };
 
   const renderMobileList = () => (
     <Grid container spacing={2}>
@@ -718,15 +756,38 @@ export function AdminMedia() {
                       borderRadius: 1,
                       overflow: 'auto',
                       bgcolor: (theme) => alpha(theme.palette.primary.main, 0.06),
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      minHeight: 200,
                     }}
                   >
-                    <LazyImage
-                      src={getMediaUrl(detail.id)}
-                      alt={detail.name}
-                      objectFit="contain"
-                      placeholder="skeleton"
-                      style={{ height: 'auto', minHeight: 200 }}
-                    />
+                    {isImageMime(detail.mime_type || '') ? (
+                      <LazyImage
+                        src={getMediaUrl(detail.id)}
+                        alt={detail.name}
+                        objectFit="contain"
+                        placeholder="skeleton"
+                        style={{ height: 'auto', minHeight: 200 }}
+                      />
+                    ) : (
+                      <Stack alignItems="center" spacing={1.5} sx={{ py: 6 }}>
+                        <FileTypeIcon name={detail.name} mime={detail.mime_type || ''} size={72} />
+                        <Typography variant="body2" color="text.secondary">
+                          非图片文件，点击下方链接下载
+                        </Typography>
+                        <Button
+                          variant="outlined"
+                          size="small"
+                          href={getMediaUrl(detail.id)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          sx={{ textTransform: 'none', borderRadius: 2 }}
+                        >
+                          下载文件
+                        </Button>
+                      </Stack>
+                    )}
                   </Box>
 
                   <Box sx={{ display: 'grid', gridTemplateColumns: '80px 1fr', gap: 1 }}>

@@ -14,6 +14,47 @@ export interface UploadMediaOptions {
   height?: number;
 }
 
+export const MAX_MEDIA_FILE_SIZE = 100 * 1024 * 1024;
+
+const ALLOWED_FILE_EXTS = [
+  'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'tgz',
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'csv', 'txt', 'md', 'rtf',
+  'odt', 'ods', 'odp', 'wps', 'et', 'dps',
+  'dwg', 'dxf', 'dwt', 'dwf', 'step', 'stp', 'iges', 'igs', 'stl', 'sldprt', 'sldasm',
+  'json', 'xml', 'yml', 'yaml', 'ini', 'cfg', 'dat', 'bin', 'iso',
+];
+
+const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'avif', 'ico'];
+
+function extOf(name: string): string {
+  const m = name.toLowerCase().match(/\.([a-z0-9]+)$/);
+  return m ? m[1] : '';
+}
+
+export function isImageMime(mimeType: string): boolean {
+  return mimeType.toLowerCase().startsWith('image/');
+}
+
+export function isAllowedFile(name: string, mimeType: string): boolean {
+  const mime = mimeType.toLowerCase();
+  if (mime.startsWith('image/') || mime.startsWith('video/') || mime.startsWith('audio/')) {
+    return true;
+  }
+  if (mime.startsWith('text/')) return true;
+  if (mime === 'application/octet-stream') return ALLOWED_FILE_EXTS.includes(extOf(name));
+  return ALLOWED_FILE_EXTS.includes(extOf(name));
+}
+
+/** 生成可下载链接（非图片会自动带 Content-Disposition） */
+export function getDownloadUrl(id: number | string): string {
+  return `${API_BASE}/api/v1/media/${id}`;
+}
+
+/** 强制下载链接（图片也可） */
+export function getForceDownloadUrl(id: number | string): string {
+  return `${API_BASE}/api/v1/media/${id}?download=1`;
+}
+
 function parseBase64(base64: string): { mimeType: string; pureBase64: string; size: number } {
   const mimeType = base64.match(/data:([^;]+);/)?.[1] || 'image/jpeg';
   const pureBase64 = base64.includes(',') ? base64.split(',')[1] : base64;
@@ -71,11 +112,13 @@ async function uploadChunks(name: string, pureBase64: string, mimeType: string, 
 
 export async function uploadMedia(name: string, base64: string, options?: UploadMediaOptions): Promise<UploadMediaResult> {
   const { mimeType, pureBase64, size } = parseBase64(base64);
-  if (!pureBase64) throw new Error('图片数据为空');
-  if (!mimeType.startsWith('image/')) throw new Error('仅支持图片文件');
+  if (!pureBase64) throw new Error('文件数据为空');
+  if (!isAllowedFile(name, mimeType)) throw new Error('不支持的文件类型');
+  if (size > MAX_MEDIA_FILE_SIZE) throw new Error('文件超过 100 MB 上限');
 
-  
-  const finalName = mimeType === 'image/jpeg' ? name.replace(/\.[^.]+$/, '.jpg') : name;
+  // 只有实为 JPEG 的图片才强制改后缀，避免把 xls 等误改名
+  const isRealJpeg = mimeType === 'image/jpeg' && IMAGE_EXTS.includes(extOf(name) || 'jpg');
+  const finalName = isRealJpeg ? name.replace(/\.[^.]+$/, '.jpg') : name;
 
   if (pureBase64.length <= MAX_MEDIA_CHUNK_SIZE) {
     return uploadSingle(finalName, pureBase64, mimeType, options);

@@ -66,6 +66,7 @@ import {
   ExpandLess,
   ExpandMore,
   MoreVert,
+  AttachFile,
 } from '@mui/icons-material';
 import {
   fetchAdminPosts,
@@ -78,7 +79,7 @@ import {
 } from '@/api/admin';
 import { generateAiPost, fetchAiSettings, fetchAiModels, formatOptimize, generateAiSummary, isTextAiModel, AiGenerateError, type AiGeneratedPost, type AiModel } from '@/api/ai';
 import { peekCache } from '@/api/client';
-import { uploadMedia, deleteMedia, extractMediaId } from '@/api/media';
+import { uploadMedia, deleteMedia, extractMediaId, MAX_MEDIA_FILE_SIZE } from '@/api/media';
 import { Loading } from '@/components/Common/Loading';
 import { ConfirmDialog } from '@/components/Common/ConfirmDialog';
 import type { AdminPost, AdminTag, PagedResult } from '@/api/admin';
@@ -150,6 +151,8 @@ export function AdminPosts() {
   const [addingTag, setAddingTag] = useState(false);
   const [inlineImageUrl, setInlineImageUrl] = useState('');
   const [inlineImageUploading, setInlineImageUploading] = useState(false);
+  const [attachmentUploading, setAttachmentUploading] = useState(false);
+  const [attachmentDialogOpen, setAttachmentDialogOpen] = useState(false);
   const [editorUseCustomFont, setEditorUseCustomFont] = useState(true);
   const [editorToolbarExpanded, setEditorToolbarExpanded] = useState(true);
   const [mobileToolbarOpen, setMobileToolbarOpen] = useState(false);
@@ -532,6 +535,59 @@ export function AdminPosts() {
     setInlineImageDialogOpen(false);
   };
 
+  
+  const readFileAsBase64 = (file: File): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error('读取文件失败'));
+      reader.readAsDataURL(file);
+    });
+
+  const formatFileSize = (bytes: number): string => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  };
+
+  /**
+   * 上传附件并在正文插入下载链接
+   * 生成 Markdown 链接，渲染后即为可点击的下载地址
+   */
+  const handleAttachment = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    if (file.size > MAX_MEDIA_FILE_SIZE) {
+      const msg = `文件超过 ${Math.round(MAX_MEDIA_FILE_SIZE / 1024 / 1024)} MB 上限`;
+      setFormError(msg);
+      enqueueSnackbar(msg, { variant: 'error' });
+      return;
+    }
+
+    setAttachmentUploading(true);
+    try {
+      const base64 = await readFileAsBase64(file);
+      const media = await uploadMedia(file.name, base64);
+      const mediaId = extractMediaId(media.url);
+      if (mediaId) setPendingMediaIds((prev) => [...prev, mediaId]);
+
+      const sizeText = formatFileSize(file.size);
+      const link = `\n[📎 下载附件：${file.name}（${sizeText}）](${media.url})\n`;
+      insertMarkdown(link);
+      setFormError('');
+      enqueueSnackbar(`附件上传成功：${file.name}`, { variant: 'success' });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '附件上传失败';
+      setFormError(msg);
+      enqueueSnackbar(msg, { variant: 'error' });
+    } finally {
+      setAttachmentUploading(false);
+      setAttachmentDialogOpen(false);
+    }
+  };
+
   const handleInsertInlineImageUrl = () => {
     const url = inlineImageUrl.trim();
     if (!url) return;
@@ -752,6 +808,12 @@ export function AdminPosts() {
       title: inlineImageUploading ? '上传中' : '图片',
       action: () => setInlineImageDialogOpen(true),
       disabled: inlineImageUploading,
+    },
+    {
+      icon: attachmentUploading ? <CircularProgress size={18} /> : <AttachFile fontSize="small" />,
+      title: attachmentUploading ? '上传中' : '附件',
+      action: () => setAttachmentDialogOpen(true),
+      disabled: attachmentUploading,
     },
     { icon: <Code fontSize="small" />, title: '代码块', action: () => insertMarkdown('```\n', '\n```') },
     { icon: <FormatQuote fontSize="small" />, title: '引用', action: () => insertMarkdown('> ', '') },
@@ -1668,8 +1730,44 @@ export function AdminPosts() {
 
           </Dialog>
 
-        </Box>
+          <Dialog open={attachmentDialogOpen} onClose={() => !attachmentUploading && setAttachmentDialogOpen(false)} fullWidth maxWidth="xs" TransitionComponent={Grow} PaperProps={{ sx: { borderRadius: { xs: 2, sm: '12px' } } }} BackdropProps={{ 'aria-hidden': false }}>
+            <DialogTitle sx={{ fontWeight: 700 }}>插入附件</DialogTitle>
 
+            <DialogContent>
+              <Stack spacing={2}>
+                <Typography variant="body2" color="text.secondary">
+                  支持压缩包、文档、图纸等，单文件最大 {Math.round(MAX_MEDIA_FILE_SIZE / 1024 / 1024)} MB。
+                  上传后会在正文插入下载链接。
+                </Typography>
+
+                <Button
+                  variant="outlined"
+                  component="label"
+                  startIcon={attachmentUploading ? <CircularProgress size={18} /> : <AttachFile />}
+                  disabled={attachmentUploading}
+                  fullWidth
+                  sx={{ textTransform: 'none', borderRadius: 2, py: 1 }}
+                >
+                  {attachmentUploading ? '上传中...' : '选择文件'}
+                  <input
+                    type="file"
+                    accept=".zip,.rar,.7z,.tar,.gz,.tgz,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.csv,.txt,.md,.dwg,.dxf,.step,.stp,.iges,.igs,.stl,application/octet-stream"
+                    style={{ position: 'absolute', width: 1, height: 1, padding: 0, margin: -1, overflow: 'hidden', clip: 'rect(0,0,0,0)', whiteSpace: 'nowrap', border: 0 }}
+                    onChange={handleAttachment}
+                  />
+                </Button>
+              </Stack>
+            </DialogContent>
+
+            <DialogActions sx={{ px: 3, pb: 2 }}>
+              <Button onClick={() => setAttachmentDialogOpen(false)} disabled={attachmentUploading} fullWidth={isMobileAdmin} sx={{ textTransform: 'none', borderRadius: 2 }}>
+                关闭
+              </Button>
+            </DialogActions>
+
+          </Dialog>
+
+        </Box>
 
         {}
         <Box
