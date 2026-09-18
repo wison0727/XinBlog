@@ -4,6 +4,7 @@ import type { HeadingItem } from '@/components/Post/TableOfContents';
 import { PostDetailHeader } from './PostDetailHeader';
 import { PostDetailContent } from './PostDetailContent';
 import { PostDetailFooter } from './PostDetailFooter';
+import { PostPaywall } from './PostPaywall';
 import { PostDetailAuthorCard } from './PostDetailAuthorCard';
 import { PostDetailRecentPosts } from './PostDetailRecentPosts';
 import { PostDetailTOC } from './PostDetailTOC';
@@ -71,6 +72,7 @@ export function PostDetailGlassLayout({
         <Box sx={{ p: { xs: 2, sm: 3, md: 6 } }}>
           <PostDetailHeader post={post} />
           <PostDetailContent content={post.content} onHeadingsExtracted={onHeadingsExtracted} />
+          {post.locked && <PostPaywall />}
           <PostDetailFooter post={post} siblings={siblings} />
           <CommentSection slug={post.slug} />
         </Box>

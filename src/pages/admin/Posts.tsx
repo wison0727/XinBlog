@@ -98,6 +98,7 @@ const emptyForm = {
   content: '',
   coverBase64: '',
   status: 'published' as 'published' | 'draft',
+  accessLevel: 'public' as 'public' | 'vip',
   tagIds: [] as number[],
 };
 
@@ -311,6 +312,7 @@ export function AdminPosts() {
       content: full.content,
       coverBase64: full.cover_base64 || '',
       status: full.status,
+      accessLevel: full.access_level === 'vip' ? 'vip' : 'public',
       tagIds: full.tags?.map((t) => t.id) || [],
     });
     setCoverLoading(!!full.cover_base64);
@@ -440,6 +442,7 @@ export function AdminPosts() {
       content: form.content,
       coverBase64: form.coverBase64 || undefined,
       status: form.status,
+      accessLevel: form.accessLevel,
       tagIds: form.tagIds,
     };
 
@@ -1370,6 +1373,23 @@ export function AdminPosts() {
 
           </FormControl>
 
+          <FormControl size="small" sx={{ minWidth: 140, display: { xs: 'none', sm: 'flex' } }}>
+            <InputLabel id="access-label">可见范围</InputLabel>
+
+            <Select
+              labelId="access-label"
+              value={form.accessLevel}
+              label="可见范围"
+              onChange={(e) => setForm((prev) => ({ ...prev, accessLevel: e.target.value as 'public' | 'vip' }))}
+            >
+              <MenuItem value="public">公开</MenuItem>
+
+              <MenuItem value="vip">仅付费会员</MenuItem>
+
+            </Select>
+
+          </FormControl>
+
           <Button variant="contained" startIcon={saving ? <CircularProgress size={16} color="inherit" /> : <Save />} onClick={handleSave} disabled={saving} sx={{ px: { xs: 2, sm: 3 } }}>
             {saving ? '保存中...' : '保存'}
           </Button>
@@ -2046,12 +2066,22 @@ export function AdminPosts() {
                       {post.title}
                     </Typography>
 
-                    <Chip
-                      label={post.status === 'published' ? '已发布' : '草稿'}
-                      size="small"
-                      color={post.status === 'published' ? 'success' : 'default'}
-                      sx={{ borderRadius: 1, flexShrink: 0 }}
-                    />
+                    <Stack direction="row" spacing={0.5} sx={{ flexShrink: 0 }}>
+                      {post.access_level === 'vip' && (
+                        <Chip
+                          label="付费"
+                          size="small"
+                          color="warning"
+                          sx={{ borderRadius: 1, flexShrink: 0 }}
+                        />
+                      )}
+                      <Chip
+                        label={post.status === 'published' ? '已发布' : '草稿'}
+                        size="small"
+                        color={post.status === 'published' ? 'success' : 'default'}
+                        sx={{ borderRadius: 1, flexShrink: 0 }}
+                      />
+                    </Stack>
                   </Box>
 
                   <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5, overflowWrap: 'break-word' }}>
@@ -2169,12 +2199,17 @@ export function AdminPosts() {
                   </TableCell>
 
                   <TableCell>
-                    <Chip
-                      label={post.status === 'published' ? '已发布' : '草稿'}
-                      size="small"
-                      color={post.status === 'published' ? 'success' : 'default'}
-                      sx={{ borderRadius: 1 }}
-                    />
+                    <Stack direction="row" spacing={0.5}>
+                      {post.access_level === 'vip' && (
+                        <Chip label="付费" size="small" color="warning" sx={{ borderRadius: 1 }} />
+                      )}
+                      <Chip
+                        label={post.status === 'published' ? '已发布' : '草稿'}
+                        size="small"
+                        color={post.status === 'published' ? 'success' : 'default'}
+                        sx={{ borderRadius: 1 }}
+                      />
+                    </Stack>
                   </TableCell>
 
                   <TableCell>

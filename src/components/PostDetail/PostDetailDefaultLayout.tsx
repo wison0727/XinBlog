@@ -4,6 +4,7 @@ import type { HeadingItem } from '@/components/Post/TableOfContents';
 import { PostDetailHeader } from './PostDetailHeader';
 import { PostDetailContent } from './PostDetailContent';
 import { PostDetailFooter } from './PostDetailFooter';
+import { PostPaywall } from './PostPaywall';
 import CommentSection from '@/components/Comment/CommentSection';
 
 interface PostDetailDefaultLayoutProps {
@@ -23,6 +24,7 @@ export function PostDetailDefaultLayout({
       <Container maxWidth="lg" sx={{ py: 4, pb: 8, px: { xs: 1, sm: 2, md: 3 } }}>
         <PostDetailHeader post={post} showBackButton={false} />
         <PostDetailContent content={post.content} onHeadingsExtracted={onHeadingsExtracted} />
+        {post.locked && <PostPaywall />}
         <PostDetailFooter post={post} siblings={siblings} />
         <CommentSection slug={post.slug} />
       </Container>

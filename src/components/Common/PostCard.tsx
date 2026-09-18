@@ -9,7 +9,7 @@ import {
   alpha,
   Fade,
 } from '@mui/material';
-import { AccessTime, Visibility } from '@mui/icons-material';
+import { AccessTime, Visibility, LockOutlined } from '@mui/icons-material';
 import { Link } from 'react-router-dom';
 import { LazyImage } from '@/components/Common/LazyImage';
 import { useSiteStore } from '@/stores/siteStore';
@@ -67,6 +67,16 @@ function CardTags({
 function CardMeta({ post, sx }: { post: Post; sx?: SxProps<Theme> }) {
   return (
     <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap', typography: 'caption', ...sx }}>
+      {post.accessLevel === 'vip' && (
+        <Chip
+          icon={<LockOutlined sx={{ fontSize: 14 }} />}
+          label="付费"
+          size="small"
+          color="warning"
+          sx={{ height: 20, fontSize: '0.7rem', fontWeight: 600, '& .MuiChip-icon': { ml: 0.5 } }}
+        />
+      )}
+
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
         <AccessTime sx={{ fontSize: 16 }} />
         {dayjs(post.createdAt).format('YYYY-MM-DD')}

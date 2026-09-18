@@ -18,6 +18,8 @@ export interface BackendPost {
   cover_base64?: string;
   author_id: number | string;
   status: string;
+  access_level?: 'public' | 'vip';
+  locked?: boolean;
   views: number;
   reading_time: number;
   created_at: string;
@@ -69,6 +71,8 @@ export function transformPost(backend: BackendPost, defaultAuthor = '星语'): P
     updatedAt: backend.updated_at,
     readingTime: backend.reading_time || 1,
     views: backend.views ?? 0,
+    accessLevel: backend.access_level === 'vip' ? 'vip' : 'public',
+    locked: backend.locked === true,
   };
 }
 

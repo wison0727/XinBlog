@@ -7,11 +7,19 @@ CREATE TABLE IF NOT EXISTS posts (
   cover_base64 TEXT,
   author_id INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'published',
+  access_level TEXT NOT NULL DEFAULT 'public',
   views INTEGER NOT NULL DEFAULT 0,
   reading_time INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_posts_access ON posts(access_level);
+
+-- 已建库升级脚本（老库执行一次即可）：
+-- ALTER TABLE posts ADD COLUMN access_level TEXT NOT NULL DEFAULT 'public';
+-- UPDATE posts SET access_level = 'public' WHERE access_level IS NULL OR access_level = '';
+-- CREATE INDEX IF NOT EXISTS idx_posts_access ON posts(access_level);
 
 CREATE TABLE IF NOT EXISTS tags (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

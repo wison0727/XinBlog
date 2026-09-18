@@ -32,6 +32,7 @@ import { getBase64Size, compressImage } from '@/utils/image';
 
 const roleLabels: Record<string, string> = {
   guest: '访客',
+  vip: '付费会员',
   admin: '管理员',
   super_admin: '超级管理员',
 };

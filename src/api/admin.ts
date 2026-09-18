@@ -75,6 +75,7 @@ export interface AdminPost {
   content: string;
   cover_base64?: string;
   status: 'published' | 'draft';
+  access_level?: 'public' | 'vip';
   views: number;
   reading_time: number;
   created_at: string;
@@ -89,6 +90,7 @@ export interface AdminPostInput {
   content: string;
   coverBase64?: string;
   status?: 'published' | 'draft';
+  accessLevel?: 'public' | 'vip';
   tagIds?: number[];
 }
 

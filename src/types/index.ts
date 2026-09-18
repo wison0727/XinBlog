@@ -24,6 +24,8 @@ export interface Tag {
   count?: number;
 }
 
+export type PostAccessLevel = 'public' | 'vip';
+
 export interface Post {
   id: string;
   title: string;
@@ -38,6 +40,10 @@ export interface Post {
   updatedAt: string;
   readingTime: number;
   views?: number;
+  /** 可见范围：public 公开 / vip 仅付费会员 */
+  accessLevel?: PostAccessLevel;
+  /** 当前登录用户是否被拦截（正文已截断） */
+  locked?: boolean;
 }
 
 export interface UserFontFile {

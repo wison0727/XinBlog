@@ -298,6 +298,90 @@ async function columnExists(db, table, col) {
 }
 
 
+let accessLevelReady = false;
+
+async function ensureAccessLevelColumn(env) {
+  if (accessLevelReady) return;
+  try {
+    const db = env.DB_POSTS;
+    if (!(await columnExists(db, 'posts', 'access_level'))) {
+      await db.prepare("ALTER TABLE posts ADD COLUMN access_level TEXT NOT NULL DEFAULT 'public'").run();
+    }
+    await db.prepare(
+      "UPDATE posts SET access_level = 'public' WHERE access_level IS NULL OR access_level = ''"
+    ).run();
+    accessLevelReady = true;
+  } catch (e) {
+    console.error('ensureAccessLevelColumn:', e && e.message);
+  }
+}
+
+
+const ACCESS_PUBLIC = 'public';
+const ACCESS_VIP = 'vip';
+const VIP_ROLES = ['vip', 'admin', 'super_admin'];
+const VIP_PREVIEW_PARAGRAPHS = 2;
+
+function normalizeAccessLevel(raw) {
+  return raw === ACCESS_VIP ? ACCESS_VIP : ACCESS_PUBLIC;
+}
+
+function isVipUser(user) {
+  return !!user && VIP_ROLES.includes(user.role);
+}
+
+
+function splitParagraphs(content) {
+  const parts = [];
+  let cur = [];
+  for (const line of String(content || '').split('\n')) {
+    if (line.trim() === '') {
+      if (cur.length) {
+        parts.push(cur.join('\n'));
+        cur = [];
+      }
+    } else {
+      cur.push(line);
+    }
+  }
+  if (cur.length) parts.push(cur.join('\n'));
+  return parts;
+}
+
+
+function buildLockedContent(content, paragraphs = VIP_PREVIEW_PARAGRAPHS) {
+  const parts = splitParagraphs(content);
+  if (parts.length <= paragraphs) return parts.join('\n\n');
+  return parts.slice(0, paragraphs).join('\n\n');
+}
+
+
+function resolvePostAccess(post, user) {
+  const level = normalizeAccessLevel(post.access_level);
+  if (level !== ACCESS_VIP) {
+    return { level, locked: false, content: post.content, preview_content: null };
+  }
+  if (isVipUser(user)) {
+    return { level, locked: false, content: post.content, preview_content: null };
+  }
+  return { level, locked: true, content: buildLockedContent(post.content), preview_content: null };
+}
+
+
+function sanitizePostForClient(post, user) {
+  if (!post) return post;
+  const access = resolvePostAccess(post, user);
+  return {
+    ...post,
+    access_level: access.level,
+    locked: access.locked,
+    content: access.content,
+    
+    preview_content: access.locked ? access.content : null,
+  };
+}
+
+
 async function migrateAgentMessagesToParts(db, id, messages) {
   const chunks = chunkAgentMessages(messages);
   if (!chunks.length) return;
@@ -867,11 +951,12 @@ async function getSiteConfig(env) {
   }
 }
 
-async function listPosts(env, url) {
+async function listPosts(env, url, request) {
   const page = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10));
   const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get('limit') || '10', 10)));
   const tag = url.searchParams.get('tag');
   const offset = (page - 1) * limit;
+  const viewer = request ? await getCurrentUser(request, env) : null;
 
   let posts;
   let total;
@@ -880,7 +965,7 @@ async function listPosts(env, url) {
     const tagRow = await env.DB_POSTS.prepare('SELECT id FROM tags WHERE slug = ?').bind(tag).first();
     if (!tagRow) return jsonResponse(0, { list: [], total: 0, page, limit });
     posts = await env.DB_POSTS.prepare(
-      `SELECT p.id, p.title, p.slug, p.excerpt, p.content, p.cover_base64, p.author_id, p.status, p.views, p.reading_time, p.created_at, p.updated_at
+      `SELECT p.id, p.title, p.slug, p.excerpt, p.content, p.cover_base64, p.author_id, p.status, p.access_level, p.views, p.reading_time, p.created_at, p.updated_at
        FROM posts p
        JOIN post_tags pt ON p.id = pt.post_id
        WHERE pt.tag_id = ? AND p.status = 'published'
@@ -897,7 +982,7 @@ async function listPosts(env, url) {
     total = countRow.c;
   } else {
     posts = await env.DB_POSTS.prepare(
-      `SELECT id, title, slug, excerpt, content, cover_base64, author_id, status, views, reading_time, created_at, updated_at
+      `SELECT id, title, slug, excerpt, content, cover_base64, author_id, status, access_level, views, reading_time, created_at, updated_at
        FROM posts WHERE status = 'published' ORDER BY created_at DESC LIMIT ? OFFSET ?`
     )
       .bind(limit, offset)
@@ -907,7 +992,8 @@ async function listPosts(env, url) {
   }
 
   
-  const list = await fillPostTags(env, posts.results || []);
+  const tagged = await fillPostTags(env, posts.results || []);
+  const list = tagged.map((p) => sanitizePostForClient(p, viewer));
   return jsonResponseWithCache(0, { list, total, page, limit }, 'ok', 200, 'public, max-age=600');
 }
 
@@ -931,18 +1017,19 @@ async function fillPostTags(env, posts) {
   return posts.map((p) => ({ ...p, tags: tagMap[p.id] || [] }));
 }
 
-async function getPost(env, path) {
+async function getPost(env, path, request) {
   const slug = path.replace('/api/v1/posts/', '');
   const post = await env.DB_POSTS.prepare(
-    `SELECT id, title, slug, excerpt, content, cover_base64, author_id, status, views, reading_time, created_at, updated_at
+    `SELECT id, title, slug, excerpt, content, cover_base64, author_id, status, access_level, views, reading_time, created_at, updated_at
      FROM posts WHERE slug = ? AND status = 'published'`
   )
     .bind(slug)
     .first();
   if (!post) return jsonResponse(404, null, 'Post not found', 404);
+  const viewer = request ? await getCurrentUser(request, env) : null;
   const list = await fillPostTags(env, [post]);
   await env.DB_POSTS.prepare('UPDATE posts SET views = views + 1 WHERE id = ?').bind(post.id).run();
-  return jsonResponse(0, list[0]);
+  return jsonResponse(0, sanitizePostForClient(list[0], viewer));
 }
 
 async function listTags(env) {
@@ -956,9 +1043,9 @@ async function listTags(env) {
   return jsonResponseWithCache(0, tags.results || [], 'ok', 200, 'public, max-age=600');
 }
 
-async function listPostsByTag(env, path) {
+async function listPostsByTag(env, path, request) {
   const slug = path.replace('/api/v1/tags/', '').replace('/posts', '');
-  return listPosts(env, new URL(`https://x.com/api/v1/posts?tag=${encodeURIComponent(slug)}`));
+  return listPosts(env, new URL(`https://x.com/api/v1/posts?tag=${encodeURIComponent(slug)}`), request);
 }
 
 
@@ -1362,7 +1449,7 @@ async function listAdminPosts(request, env, user) {
   if (keyword) {
     const like = `%${keyword}%`;
     posts = await env.DB_POSTS.prepare(
-      `SELECT id, title, slug, excerpt, status, views, reading_time, created_at, updated_at
+      `SELECT id, title, slug, excerpt, status, access_level, views, reading_time, created_at, updated_at
        FROM posts WHERE title LIKE ? OR excerpt LIKE ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
     )
       .bind(like, like, limit, offset)
@@ -1374,7 +1461,7 @@ async function listAdminPosts(request, env, user) {
       .first();
   } else {
     posts = await env.DB_POSTS.prepare(
-      `SELECT id, title, slug, excerpt, status, views, reading_time, created_at, updated_at
+      `SELECT id, title, slug, excerpt, status, access_level, views, reading_time, created_at, updated_at
        FROM posts ORDER BY created_at DESC LIMIT ? OFFSET ?`
     )
       .bind(limit, offset)
@@ -1391,7 +1478,7 @@ async function getAdminPost(request, env, user) {
     ? parseInt(url.searchParams.get('id'), 10)
     : parseInt(request.url.split('/').pop(), 10);
   const post = await env.DB_POSTS.prepare(
-    `SELECT id, title, slug, excerpt, content, cover_base64, author_id, status, views, reading_time, created_at, updated_at
+    `SELECT id, title, slug, excerpt, content, cover_base64, author_id, status, access_level, views, reading_time, created_at, updated_at
      FROM posts WHERE id = ?`
   )
     .bind(id)
@@ -1430,6 +1517,7 @@ async function createPost(request, env, user) {
   const cover = body.coverBase64 || null;
   const tagIds = body.tagIds || [];
   const status = body.status === 'draft' ? 'draft' : 'published';
+  const accessLevel = normalizeAccessLevel(body.accessLevel);
 
   if (!title || !content) return jsonResponse(400, null, '标题和内容必填');
   if (!slug) slug = slugify(title);
@@ -1438,9 +1526,9 @@ async function createPost(request, env, user) {
   const time = now();
   try {
     const result = await env.DB_POSTS.prepare(
-      'INSERT INTO posts (title, slug, excerpt, content, cover_base64, author_id, status, reading_time, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      'INSERT INTO posts (title, slug, excerpt, content, cover_base64, author_id, status, access_level, reading_time, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     )
-      .bind(title, slug, excerpt, content, cover, user.id, status, readingTime(content), time, time)
+      .bind(title, slug, excerpt, content, cover, user.id, status, accessLevel, readingTime(content), time, time)
       .run();
     const postId = result.meta ? result.meta.last_row_id : null;
 
@@ -1490,6 +1578,10 @@ async function updatePost(request, env, user) {
   if (body.status !== undefined) {
     updates.push("status = ?");
     params.push(body.status === 'draft' ? 'draft' : 'published');
+  }
+  if (body.accessLevel !== undefined) {
+    updates.push('access_level = ?');
+    params.push(normalizeAccessLevel(body.accessLevel));
   }
   if (updates.length === 0) return jsonResponse(400, null, '无更新内容');
 
@@ -4814,8 +4906,11 @@ async function updateAdminUser(request, env, user) {
     params.push(body.email ? String(body.email).trim() : null);
   }
   if (body.role !== undefined) {
+    const ROLE_WHITELIST = ['guest', 'vip', 'admin', 'super_admin'];
+    const nextRole = String(body.role);
+    if (!ROLE_WHITELIST.includes(nextRole)) return jsonResponse(400, null, '角色无效');
     updates.push('role = ?');
-    params.push(String(body.role));
+    params.push(nextRole);
   }
   if (body.status !== undefined) {
     updates.push('status = ?');
@@ -8160,6 +8255,7 @@ export default {
     }
 
     try {
+      await ensureAccessLevelColumn(env);
       
       function rejectChatSocket(message, code = 403) {
         const pair = new WebSocketPair();
@@ -8311,7 +8407,7 @@ export default {
       
       if (method === 'GET' && path === '/api/v1/site') return await getSiteConfig(env);
       if (method === 'GET' && path === '/manifest.json') return await getManifest(env, request.url);
-      if (method === 'GET' && path === '/api/v1/posts') return await listPosts(env, url);
+      if (method === 'GET' && path === '/api/v1/posts') return await listPosts(env, url, request);
 
       
       if (method === 'GET' && path === '/api/v1/resolve-url') return await resolveUrl(request);
@@ -8330,7 +8426,7 @@ export default {
       if (method === 'POST' && path.match(/^\/api\/v1\/posts\/[^/]+\/likes$/)) return await requireAuth(request, env, createLike);
       if (method === 'DELETE' && path.match(/^\/api\/v1\/posts\/[^/]+\/likes$/)) return await requireAuth(request, env, deleteLike);
 
-      if (method === 'GET' && path.startsWith('/api/v1/posts/')) return await getPost(env, path);
+      if (method === 'GET' && path.startsWith('/api/v1/posts/')) return await getPost(env, path, request);
       if (method === 'GET' && path === '/api/v1/tags') return await listTags(env);
       if (method === 'GET' && path.startsWith('/api/v1/media/')) {
         const mediaId = parseInt(path.replace('/api/v1/media/', ''), 10);
@@ -8338,7 +8434,7 @@ export default {
         return await getMedia(env, mediaId, request, ctx);
       }
       if (method === 'GET' && path.endsWith('/posts') && path.startsWith('/api/v1/tags/')) {
-        return await listPostsByTag(env, path);
+        return await listPostsByTag(env, path, request);
       }
 
       

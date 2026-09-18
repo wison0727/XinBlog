@@ -276,7 +276,15 @@ export function Users() {
 
                   <TableCell>{user.email || '-'}</TableCell>
 
-                  <TableCell>{user.role === 'super_admin' ? '超级管理员' : user.role === 'admin' ? '管理员' : '访客'}</TableCell>
+                  <TableCell>
+                    {user.role === 'super_admin'
+                      ? '超级管理员'
+                      : user.role === 'admin'
+                        ? '管理员'
+                        : user.role === 'vip'
+                          ? '付费会员'
+                          : '访客'}
+                  </TableCell>
 
                   <TableCell>{user.status === 1 ? '正常' : '禁用'}</TableCell>
 
@@ -365,6 +373,8 @@ export function Users() {
                 onChange={(e) => setEditForm((prev) => ({ ...prev, role: e.target.value as string }))}
               >
                 <MenuItem value="guest">访客</MenuItem>
+
+                <MenuItem value="vip">付费会员</MenuItem>
 
                 <MenuItem value="admin">管理员</MenuItem>
 

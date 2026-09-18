@@ -3,7 +3,7 @@ import { persist } from 'zustand/middleware';
 import { apiPost } from '@/api/client';
 import type { CaptchaPayload } from '@/api/captcha';
 
-export type UserRole = 'guest' | 'admin' | 'super_admin';
+export type UserRole = 'guest' | 'vip' | 'admin' | 'super_admin';
 
 export interface AuthUser {
   id: string;
