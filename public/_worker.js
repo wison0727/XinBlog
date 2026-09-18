@@ -1088,19 +1088,43 @@ async function checkRateLimit(env, key, limit, windowSec) {
     }
     throw e;
   }
+
+  
+  if (Math.random() < 0.05) {
+    try {
+      await db.prepare('DELETE FROM rate_limits WHERE window_start < ?').bind(bucket - 2).run();
+    } catch (e) {
+      console.error('rate limit gc:', e && e.message);
+    }
+  }
+
   const row = await db.prepare('SELECT count, window_start FROM rate_limits WHERE key = ?').bind(bucketKey).first();
   if (!row) return true;
   
-  if (row.window_start !== bucket) {
-    await db.prepare('UPDATE rate_limits SET count = 1, window_start = ? WHERE key = ?').bind(bucket, bucketKey).run();
-    return true;
-  }
-  
-  if (Math.random() < 0.02) {
-    await db.prepare('DELETE FROM rate_limits WHERE window_start < ?').bind(bucket - 3).run();
-  }
+  if (row.window_start !== bucket) return true;
   return row.count <= limit;
 }
+
+
+function buildRateLimitResponse(key) {
+  const windowSec = key.startsWith('login:') ? LOGIN_RATE_WINDOW_SEC : 600;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const elapsed = nowSec % windowSec;
+  const retryAfter = windowSec - elapsed;
+  return {
+    retryAfter,
+    message: `尝试次数过多，请 ${formatDuration(retryAfter)}后再试`,
+  };
+}
+
+
+function formatDuration(sec) {
+  if (sec <= 60) return `${Math.max(1, sec)} 秒`;
+  const m = Math.ceil(sec / 60);
+  return `${m} 分钟`;
+}
+
+const LOGIN_RATE_WINDOW_SEC = 600;
 
 async function register(request, env) {
   const body = await request.json();
@@ -1192,12 +1216,20 @@ async function login(request, env) {
 
   
   const loginIp = getClientIp(request);
-  if (!(await checkRateLimit(env, `login:ip:${loginIp}`, 10, 600))) {
-    return jsonResponse(429, null, '尝试次数过多，请 10 分钟后再试', 429);
+  if (!(await checkRateLimit(env, `login:ip:${loginIp}`, 30, LOGIN_RATE_WINDOW_SEC))) {
+    const { message, retryAfter } = buildRateLimitResponse('login:ip');
+    return new Response(
+      JSON.stringify({ code: 429, data: { retryAfter }, msg: message }),
+      { status: 429, headers: { 'Content-Type': 'application/json', 'Retry-After': String(retryAfter) } }
+    );
   }
   const accountKey = account.toLowerCase();
-  if (!(await checkRateLimit(env, `login:acc:${accountKey}`, 5, 600))) {
-    return jsonResponse(429, null, '该账号尝试次数过多，请 10 分钟后再试', 429);
+  if (!(await checkRateLimit(env, `login:acc:${accountKey}`, 8, LOGIN_RATE_WINDOW_SEC))) {
+    const { message, retryAfter } = buildRateLimitResponse('login:acc');
+    return new Response(
+      JSON.stringify({ code: 429, data: { retryAfter }, msg: `该账号${message}` }),
+      { status: 429, headers: { 'Content-Type': 'application/json', 'Retry-After': String(retryAfter) } }
+    );
   }
 
   let user = await env.DB_USERS.prepare(
